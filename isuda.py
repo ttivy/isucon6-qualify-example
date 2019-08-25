@@ -93,6 +93,8 @@ def authenticate(func):
 
 @app.route('/initialize')
 def get_initialize():
+    global _keywords_update
+    _keywords_update = 0
     #return jsonify(result = 'ok')
     cur = dbh().cursor()
     cur.execute('DELETE FROM entry WHERE id > 7101')
@@ -101,7 +103,7 @@ def get_initialize():
     cur.execute('SELECT keyword FROM entry')
     r = rh()
     r.flushdb()
-    r.incr('keywords_update')
+    r.set('keywords_update', 1)
     #r.hmset('rendered_keywords', {})
     r.hmset('keywords', {
         escaped_keyword: '<a href="%s">%s</a>' % (
