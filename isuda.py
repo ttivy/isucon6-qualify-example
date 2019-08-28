@@ -8,16 +8,18 @@ import os
 import operator as op
 import pathlib
 import random
+import regex as re
 import string
 import urllib
+import urllib.parse
 import redis
+import pickle
 import replacer
+import datetime
 
 app = Flask(__name__, static_folder = None)
 
 app.secret_key = 'tonymoris'
-
-var = {}
 
 _config = {
     'db_host':       os.environ.get('ISUDA_DB_HOST', 'localhost'),
@@ -35,28 +37,34 @@ def config(key):
     else:
         raise "config value of %s undefined" % key
 
+def _dbh():
+    return MySQLdb.connect(**{
+        'host': config('db_host'),
+        'port': config('db_port'),
+        'user': config('db_user'),
+        'passwd': config('db_password'),
+        'db': 'isuda',
+        'charset': 'utf8mb4',
+        'cursorclass': MySQLdb.cursors.DictCursor,
+        'autocommit': True,
+        'sql_mode': 'TRADITIONAL,NO_AUTO_VALUE_ON_ZERO,ONLY_FULL_GROUP_BY',
+    })
+
+def _rh():
+    return  redis.StrictRedis(
+        host = config('redis_host'),
+        port = config('redis_port'),
+        decode_responses = True,
+    )
+
 def dbh():
     if not hasattr(g, 'db'):
-        g.db = MySQLdb.connect(**{
-            'host': config('db_host'),
-            'port': config('db_port'),
-            'user': config('db_user'),
-            'passwd': config('db_password'),
-            'db': 'isuda',
-            'charset': 'utf8mb4',
-            'cursorclass': MySQLdb.cursors.DictCursor,
-            'autocommit': True,
-            'sql_mode': 'TRADITIONAL,NO_AUTO_VALUE_ON_ZERO,ONLY_FULL_GROUP_BY',
-        })
+        g.db = _dbh()
     return g.db
 
 def rh():
     if not hasattr(g, 'redis'):
-        g.redis = redis.StrictRedis(
-            host = config('redis_host'),
-            port = config('redis_port'),
-            decode_responses = True,
-        )
+        g.redis = _rh()
     return g.redis
 
 @app.teardown_request
@@ -68,7 +76,7 @@ def close_db(exception=None):
 
 @app.template_filter()
 def ucfirst(str):
-    return str[0].upper() + str[-len(str) + 1:]
+    return str[0].upper() + str[1:]
 
 def set_name(func):
     import functools
@@ -88,33 +96,16 @@ def authenticate(func):
         if not hasattr(request, 'user_id'):
             abort(403)
         return func(*args, **kwargs)
-
     return wrapper
 
 @app.route('/initialize')
 def get_initialize():
-    global _keywords_update
-    _keywords_update = 0
-    #return jsonify(result = 'ok')
     cur = dbh().cursor()
     cur.execute('DELETE FROM entry WHERE id > 7101')
     cur.execute('TRUNCATE star')
     # redis
-    cur.execute('SELECT keyword FROM entry')
     r = rh()
-    r.flushdb()
-    r.set('keywords_update', 1)
-    #r.hmset('rendered_keywords', {})
-    r.hmset('keywords', {
-        escaped_keyword: '<a href="%s">%s</a>' % (
-            url_for('get_keyword', keyword = keyword),
-            escaped_keyword,
-        )
-        for keyword, escaped_keyword in (
-            (keyword, html.escape(keyword))
-            for keyword in map(op.itemgetter('keyword'), cur.fetchall())
-        )
-    })
+    initialize_redis(cur, r)
     return jsonify(result = 'ok')
 
 @app.route('/')
@@ -123,31 +114,25 @@ def get_index():
     PER_PAGE = 10
     page = int(request.args.get('page', '1'))
 
-    con = dbh()
-    con.autocommit = False
-    cur = con.cursor()
     r = rh()
-    try:
-        cur.execute('SELECT keyword, description FROM entry ORDER BY updated_at DESC LIMIT %s OFFSET %s LOCK IN SHARE MODE',
-                    (PER_PAGE, PER_PAGE * (page - 1),))
-        entries = cur.fetchall()
-        for entry in entries:
-            keyword = entry['keyword']
-            if r.hexists('rendered_keywords', keyword):
-                entry['html'] = r.hget('rendered_keywords', keyword)
-            else:
-                entry['html'] = htmlify(entry['description'])
-                r.hset('rendered_keywords', keyword, entry['html'])
-            entry['stars'] = load_stars(entry['keyword'])
+    count = r.zcard('z:keywords')
+    # Get keywords in page
+    keywords = r.zrevrange('z:keywords', PER_PAGE * (page - 1), PER_PAGE * page)
+    # Get entries by keywords
+    with r.pipeline() as p:
+        for keyword in keywords:
+            p.hgetall('hm:keywords:%s' % keyword)
+        entries = p.execute()
+    # Render html
+    for entry in entries:
+        entry['html'] = r.hget('hm:html', entry['keyword'])
+        if entry['html'] is None:
+            entry['html'] = htmlify(entry['description'])
+            r.hset('hm:html', entry['keyword'], entry['html'])
+        stars = r.lrange('list:stars:%s' % entry['keyword'], 0, -1)
+        entry['stars'] = [{'user_name': star} for star in stars]
 
-        cur.execute('SELECT CEIL(COUNT(*) / %s) AS last_page FROM entry', (PER_PAGE, ))
-        row = cur.fetchone()
-        last_page = row['last_page']
-        con.commit()
-    except:
-        con.rollback()
-        raise
-
+    last_page = math.ceil(count / PER_PAGE)
     pages = range(max(1, page - 5), min(last_page, page+5) + 1)
 
     return render_template('index.html', entries = entries, page = page, last_page = last_page, pages = pages)
@@ -170,31 +155,39 @@ def create_keyword():
     if is_spam_contents(description) or is_spam_contents(keyword):
         abort(400)
 
-    con = dbh()
-    con.autocommit = False
-    cur = con.cursor()
     r = rh()
-    try:
-        escaped_keyword = html.escape(keyword)
-        cur.execute('SELECT id FROM entry WHERE keyword = %s FOR UPDATE', (keyword, ))
+    if r.zscore('z:keywords', keyword) is None:
+        cur = dbh().cursor()
+        cur.execute('INSERT INTO entry (author_id, keyword, description, updated_at) VALUES (%s, %s, %s, NOW())', (user_id, keyword, description))
+        cur.execute('SELECT UNIX_TIMESTAMP(updated_at) as updated_at FROM entry WHERE keyword = %s', (keyword,))
         entry = cur.fetchone()
-        if entry is None:
-            # create
-            sql = 'INSERT INTO entry (author_id, keyword, description, updated_at) VALUES (%s, %s, %s, NOW())'
-            cur.execute(sql, (user_id, keyword, description))
+        # Create new keyword
+        with r.pipeline() as p:
+            p.zadd('z:keywords', {keyword: entry['updated_at']}, nx = True)
+            p.hmset('hm:keywords:%s' % keyword, {
+                'keyword': keyword,
+                'description': description,
+            })
+            escaped_keyword = html.escape(keyword)
             url = url_for('get_keyword', keyword = keyword)
-            r.incr('keywords_update')
-            r.hset('keywords', escaped_keyword, '<a href="%s">%s</a>' % (url, escaped_keyword))
-            r.delete('rendered_keywords')
-        else:
-            # upadte
-            sql = 'UPDATE entry SET author_id = %s, description = %s, updated_at = NOW() WHERE id = %s'
-            cur.execute(sql, (user_id, description, entry['id']))
-            r.hdel('rendered_keywords', keyword)
-        con.commit()
-    except:
-        con.rollback()
-        raise
+            link = '<a href="%s">%s</a>' % (url, escaped_keyword)
+            p.delete('hm:html')
+            p.hset('hm:replacements', escaped_keyword, link)
+            p.incr('keyword_modified')
+            p.execute()
+    else:
+        cur = dbh().cursor()
+        cur.execute('UPDATE entry SET author_id = %s, description = %s, updated_at = NOW() WHERE keyword = %s', (user_id, description, keyword))
+        cur.execute('SELECT UNIX_TIMESTAMP(updated_at) as updated_at FROM entry WHERE keyword = %s', (keyword,))
+        entry = cur.fetchone()
+        # Update already existing keyword
+        with r.pipeline() as p:
+            p.zadd('z:keywords', {keyword: entry['updated_at']}, xx = True)
+            p.hmset('hm:keywords:%s' % keyword, {
+                'description': description,
+            })
+            p.hdel('hm:html', keyword)
+            p.execute()
 
     return redirect('/')
 
@@ -252,27 +245,17 @@ def get_keyword(keyword):
     if keyword == '':
         abort(400)
 
-    con = dbh()
-    con.autocommit = False
-    cur = con.cursor()
     r = rh()
-    try:
-        cur.execute('SELECT keyword, description FROM entry WHERE keyword = %s LOCK IN SHARE MODE', (keyword,))
-        entry = cur.fetchone()
-        if entry == None:
-            abort(404)
+    # Get entry by keyword
+    entry = r.hgetall('hm:keywords:%s' % keyword)
+    # Render html
+    entry['html'] = r.hget('hm:html', entry['keyword'])
+    if entry['html'] is None:
+        entry['html'] = htmlify(entry['description'])
+        r.hset('hm:html', entry['keyword'], entry['html'])
+    stars = r.lrange('list:stars:%s' % entry['keyword'], 0, -1)
+    entry['stars'] = [{'user_name': star} for star in stars]
 
-        if r.hexists('rendered_keywords', keyword):
-            entry['html'] = r.hget('rendered_keywords', keyword)
-        else:
-            entry['html'] = htmlify(entry['description'])
-            r.hset('rendered_keywords', keyword, entry['html'])
-        con.commit()
-    except:
-        con.rollback()
-        raise
-
-    entry['stars'] = load_stars(entry['keyword'])
     return render_template('keyword.html', entry = entry)
 
 @app.route('/keyword/<keyword>', methods=['POST'])
@@ -282,32 +265,28 @@ def delete_keyword(keyword):
     if keyword == '':
         abort(400)
 
-    con = dbh()
-    con.autocommit = False
-    cur = con.cursor()
-    try:
-        cur.execute('SELECT * FROM entry WHERE keyword = %s FOR UPDATE', (keyword, ))
-        row = cur.fetchone()
-        if row == None:
-            abort(404)
+    r = rh()
+    if r.zscore('z:keywords', keyword) is None:
+        abort(404)
 
-        cur.execute('DELETE FROM entry WHERE keyword = %s', (keyword,))
+    cur = dbh().cursor()
+    cur.execute('DELETE FROM entry WHERE keyword = %s', (keyword,))
+    with r.pipeline() as p:
+        p.zrem('z:keywords', keyword)
+        p.delete('hm:keywords:%s' % keyword)
         escaped_keyword = html.escape(keyword)
-        r = rh()
-        r.incr('keywords_update')
-        r.hdel('keywords', escaped_keyword)
-        r.delete('rendered_keywords')
-        con.commit()
-    except:
-        con.rollback()
-        raise
+        p.delete('hm:html')
+        p.hdel('hm:replacements', escaped_keyword)
+        p.incr('keyword_modified')
+        p.execute()
 
     return redirect('/')
 
 @app.route("/stars")
 def get_stars():
+    request.args['keyword']
     cur = dbh().cursor()
-    cur.execute('SELECT * FROM star WHERE keyword = %s', (request.args['keyword'], ))
+    cur.execute('SELECT id, keyword, user_name, created_at FROM star WHERE keyword = %s', (keyword, ))
     return jsonify(stars = cur.fetchall())
 
 @app.route("/stars", methods=['POST'])
@@ -316,69 +295,44 @@ def post_stars():
     if keyword == None or keyword == "":
         keyword = request.form['keyword']
 
-    cur = dbh().cursor()
-    cur.execute('SELECT id FROM entry WHERE keyword = %s', (keyword,))
-    entry = cur.fetchone()
-
-    if entry is None:
+    r = rh()
+    if r.zscore('z:keywords', keyword) is None:
         abort(404)
 
+    user_name = request.args.get('user', "")
+    if user_name == None or user_name == "":
+        user_name = request.form['user']
+
     cur = dbh().cursor()
-    user = request.args.get('user', "")
-    if user == None or user == "":
-        user = request.form['user']
-
-    cur.execute("""
-        INSERT INTO star (entry_id, user_id)
-        SELECT entry.id, user.id
-        FROM entry JOIN user
-        WHERE entry.keyword = %s
-          AND user.name = %s
-"""
-    , (keyword, user))
-
+    cur.execute('INSERT INTO star (keyword, user_name, created_at) VALUES (%s, %s, NOW())', (keyword, user_name))
+    r.rpush('list:stars:%s' % keyword, user_name)
     return jsonify(result = 'ok')
 
-_keywords_update = 0
+_keyword_modified = 0
 _keyword_replacer = None
 def get_keyword_replacer():
-    global _keywords_update, _keyword_replacer
     # check onece on every request
-    if not hasattr(g, 'keywords_update'):
+    if not hasattr(g, 'keyword_replacer'):
+        global _keyword_modified, _keyword_replacer
         r = rh()
-        g.keywords_update = int(r.get('keywords_update'))
-        if _keywords_update < g.keywords_update:
-            # update cache
-            _keywords_update = g.keywords_update
-            _keyword_replacer = replacer.Replacer(r.hgetall('keywords'))
-    return _keyword_replacer
+        keyword_modified = r.get('keyword_modified')
+        # update cache
+        if _keyword_modified != keyword_modified:
+            replacements = r.hgetall('hm:replacements')
+            _keyword_replacer = replacer.Replacer(replacements)
+        _keyword_modified = keyword_modified
+        g.keyword_replacer = _keyword_replacer
+    return g.keyword_replacer
 
 def htmlify(content):
     if content is None or content == '':
         return ''
 
-    result = html.escape(content)
-
     keyword_replacer = get_keyword_replacer()
+    result = html.escape(content)
     result = keyword_replacer.replace(result)
 
     return result.replace("\n", '<br />')
-
-def load_stars(keyword):
-    cur = dbh().cursor()
-    # Used user_name only
-    cur.execute("""
-        SELECT user.name as user_name
-        FROM star
-          JOIN entry
-            ON star.entry_id = entry.id
-          JOIN user
-            ON star.user_id = user.id
-        WHERE keyword = %s
-"""
-    , (keyword, ))
-    stars = cur.fetchall()
-    return stars
 
 def is_spam_contents(content):
     with urllib.request.urlopen(config('isupam_origin'), urllib.parse.urlencode({ "content": content }).encode('utf-8')) as res:
@@ -386,6 +340,55 @@ def is_spam_contents(content):
         return not data['valid']
 
     return False
+
+def initialize_redis(cur, r):
+    with r.pipeline() as p:
+        p.flushdb()
+        p.set('initialized', 'OK')
+        # Get entry
+        cur.execute("""
+            SELECT keyword, description, UNIX_TIMESTAMP(updated_at) AS updated_at
+            FROM entry
+        """)
+        entries = cur.fetchall()
+        p.zadd('z:keywords', {
+            entry['keyword']: entry['updated_at']
+            for entry in entries
+        })
+        for entry in entries:
+            p.hmset('hm:keywords:%s' % entry['keyword'], {
+                'keyword': entry['keyword'],
+                'description': entry['description'],
+            })
+        p.hmset('hm:replacements', {
+            escaped_keyword: '<a href="/keyword/%s">%s</a>' % (
+                urllib.parse.quote(keyword, safe=''),
+                escaped_keyword,
+            )
+            for keyword, escaped_keyword in (
+                (entry['keyword'], html.escape(entry['keyword']))
+                for entry in entries
+            )
+        })
+        p.incr('keyword_modified')
+        # Get star
+        cur.execute("""
+            SELECT keyword, user_name
+            FROM star
+        """)
+        stars = cur.fetchall()
+        for star in stars:
+            p.rpush('list:stars:%s' % star['keyword'], star['user_name'])
+        # Execute
+        p.execute()
+    return
+
+# Initialize
+with _dbh() as cur:
+    r = _rh()
+    if r.exists('initialized') == 0:
+        initialize_redis(cur, r)
+    r.close()
 
 if __name__ == "__main__":
     from wsgi_lineprof.middleware import LineProfilerMiddleware
